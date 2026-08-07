@@ -1,0 +1,43 @@
+# Git / CI
+.git
+.gitignore
+.github
+.dockerignore
+.ci/*
+!.ci/requirements.txt
+!.ci/scan_addons.py
+
+# Local Python / cache
+__pycache__/
+*.pyc
+*.pyo
+*.log
+
+# Virtualenvs or build outputs
+venv/
+build/
+dist/
+
+# Editor / system files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Tests or docs
+/tests
+/docs
+
+# Never send local configuration, dumps, keys, or generated state to BuildKit.
+.env
+.env.*
+!.env.example
+*.sql
+*.dump
+*.backup
+*.tar
+*.zip
+*.pem
+*.key
+filestore/
+postgres-data/

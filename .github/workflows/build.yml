@@ -1,0 +1,263 @@
+name: Build and deploy Odoo
+
+on:
+  push:
+    branches:
+      - "19.0-dev"
+      - "19.0-sass-3"
+      - "19.0"
+  workflow_dispatch:
+    inputs:
+      modules:
+        description: Optional comma-separated technical module names
+        required: false
+        type: string
+      image_only:
+        description: Explicitly skip automatic custom-module updates
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  route:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      environment: ${{ steps.route.outputs.environment }}
+      convenience_tag: ${{ steps.route.outputs.convenience_tag }}
+    steps:
+      - name: Check out the canonical branch resolver
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .ci/resolve_environment.py
+          sparse-checkout-cone-mode: false
+
+      - name: Resolve exact deployment environment
+        id: route
+        shell: bash
+        env:
+          REQUESTED_BRANCH: ${{ github.ref_name }}
+          REQUESTED_REF_TYPE: ${{ github.ref_type }}
+          REQUESTED_FULL_REF: ${{ github.ref }}
+          DEVELOPMENT_BRANCH: "19.0-dev"
+          STAGING_BRANCH: "19.0-sass-3"
+          LIVE_BRANCH: "19.0"
+        run: |
+          set -Eeuo pipefail
+          python3 .ci/resolve_environment.py \
+            --ref "$REQUESTED_BRANCH" \
+            --ref-type "$REQUESTED_REF_TYPE" \
+            --full-ref "$REQUESTED_FULL_REF" \
+            --development "$DEVELOPMENT_BRANCH" \
+            --staging "$STAGING_BRANCH" \
+            --live "$LIVE_BRANCH" \
+            --github-output "$GITHUB_OUTPUT"
+
+  build:
+    needs: route
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: build-sha-${{ github.sha }}
+      cancel-in-progress: false
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Scan custom addons without executing repository code
+        run: |
+          python3 .ci/scan_addons.py \
+            --root . \
+            --odoo-version 19.0 \
+            --output /tmp/odoo-addon-manifest.json
+          python3 -m json.tool /tmp/odoo-addon-manifest.json
+
+      - name: Compute immutable and convenience tags
+        id: meta
+        shell: bash
+        env:
+          ROUTED_ENVIRONMENT: ${{ needs.route.outputs.environment }}
+          CONVENIENCE_TAG: ${{ needs.route.outputs.convenience_tag }}
+        run: |
+          set -Eeuo pipefail
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          repository="${GITHUB_REPOSITORY#*/}"
+          image="ghcr.io/${owner}/${repository,,}"
+          printf 'image=%s\n' "$image" >> "$GITHUB_OUTPUT"
+          printf 'build_date=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+          [[ "$ROUTED_ENVIRONMENT" == "$CONVENIENCE_TAG" ]] || { echo 'Route output is inconsistent.' >&2; exit 1; }
+          printf 'tags=%s:sha-%s,%s:%s-latest\n' \
+            "$image" "$GITHUB_SHA" "$image" "$CONVENIENCE_TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Refuse to overwrite the commit-SHA tag
+        shell: bash
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+        run: |
+          set -Eeuo pipefail
+          immutable_ref="$IMAGE:sha-$GITHUB_SHA"
+          set +e
+          inspect_output="$(docker buildx imagetools inspect --raw "$immutable_ref" 2>&1)"
+          inspect_status=$?
+          set -e
+          if ((inspect_status == 0)); then
+            echo "Immutable commit tag already exists; use its recorded digest or a new commit." >&2
+            exit 1
+          fi
+          # Absence is the only acceptable failure. Authentication, transport,
+          # rate-limit, server, and malformed-response failures must stop the
+          # build so they cannot be mistaken for permission to overwrite.
+          if ! grep -Eiq 'manifest unknown|(^|: )not found([:.]|$)' <<< "$inspect_output"; then
+            printf 'Could not prove immutable tag absence; refusing build.\n%s\n' "$inspect_output" >&2
+            exit 1
+          fi
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: .ci/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha,scope=${{ github.ref_name }}
+          cache-to: type=gha,mode=max,scope=${{ github.ref_name }}
+          build-args: |
+            ODOO_VERSION=19.0
+            GIT_SHA=${{ github.sha }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+            SOURCE_URL=https://github.com/${{ github.repository }}
+
+      - name: Verify immutable commit tag after push
+        shell: bash
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          BUILT_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$BUILT_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]] || {
+            echo 'Build did not return a valid registry digest.' >&2
+            exit 1
+          }
+          immutable_ref="$IMAGE:sha-$GITHUB_SHA"
+          inspect_output="$(docker buildx imagetools inspect "$immutable_ref")"
+          mapfile -t reported_digests < <(awk '$1 == "Digest:" { print $2 }' <<< "$inspect_output")
+          [[ "${#reported_digests[@]}" -eq 1 && "${reported_digests[0]}" == "$BUILT_DIGEST" ]] || {
+            echo 'Immutable commit tag does not resolve to the digest produced by this build.' >&2
+            exit 1
+          }
+
+  deploy:
+    needs: [route, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: read
+    concurrency:
+      group: deploy-${{ needs.route.outputs.environment }}
+      cancel-in-progress: false
+    environment: ${{ needs.route.outputs.environment }}
+    steps:
+      - name: Derive and validate deployment inputs
+        id: meta
+        shell: bash
+        env:
+          DISPATCH_MODULES: ${{ inputs.modules }}
+          DEFAULT_MODULES: ${{ vars.ODOO_DEPLOY_MODULES }}
+          REQUESTED_IMAGE_ONLY: ${{ inputs.image_only }}
+          BUILT_IMAGE: ${{ needs.build.outputs.image }}
+          BUILT_DIGEST: ${{ needs.build.outputs.digest }}
+          ROUTED_ENVIRONMENT: ${{ needs.route.outputs.environment }}
+        run: |
+          set -Eeuo pipefail
+          modules="${DISPATCH_MODULES:-$DEFAULT_MODULES}"
+          image_only="${REQUESTED_IMAGE_ONLY:-false}"
+          [[ -z "$modules" || "$modules" =~ ^[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*$ ]] || { echo 'Module list is malformed.' >&2; exit 1; }
+          [[ "$BUILT_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo 'Build did not return an immutable digest.' >&2; exit 1; }
+          printf 'environment=%s\nimage=%s@%s\nmodules=%s\nimage_only=%s\n' \
+            "$ROUTED_ENVIRONMENT" "$BUILT_IMAGE" "$BUILT_DIGEST" "$modules" "$image_only" >> "$GITHUB_OUTPUT"
+
+      - name: Validate deployment connection settings
+        shell: bash
+        env:
+          VM_HOST: ${{ vars.VM_HOST }}
+          VM_PORT: ${{ vars.VM_SSH_PORT }}
+          VM_USER: ${{ vars.VM_USER }}
+          SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.VM_SSH_KNOWN_HOSTS }}
+        run: |
+          set -Eeuo pipefail
+          missing=()
+          [[ -n "$VM_HOST" ]] || missing+=(VM_HOST)
+          [[ -n "$VM_USER" ]] || missing+=(VM_USER)
+          [[ -n "$SSH_KEY" ]] || missing+=(VM_SSH_KEY)
+          [[ -n "$SSH_KNOWN_HOSTS" ]] || missing+=(VM_SSH_KNOWN_HOSTS)
+          ((${#missing[@]} == 0)) || { printf 'Missing GitHub environment connection settings: %s\n' "${missing[*]}" >&2; exit 1; }
+          [[ "$VM_HOST" =~ ^[A-Za-z0-9.-]+$ ]] || { echo 'VM_HOST is malformed.' >&2; exit 1; }
+          [[ "$VM_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo 'VM_USER is malformed.' >&2; exit 1; }
+          port="${VM_PORT:-22}"
+          [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)) || { echo 'VM_SSH_PORT is invalid.' >&2; exit 1; }
+
+      - name: Configure verified SSH
+        env:
+          VM_HOST: ${{ vars.VM_HOST }}
+          VM_PORT: ${{ vars.VM_SSH_PORT }}
+          SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.VM_SSH_KNOWN_HOSTS }}
+        run: |
+          set -Eeuo pipefail
+          install -d -m 0700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 0600 ~/.ssh/id_ed25519 ~/.ssh/known_hosts
+          ssh-keygen -y -f ~/.ssh/id_ed25519 >/dev/null
+          port="${VM_PORT:-22}"
+          lookup="$VM_HOST"
+          [[ "$port" == 22 ]] || lookup="[$VM_HOST]:$port"
+          ssh-keygen -F "$lookup" -f ~/.ssh/known_hosts >/dev/null || { echo "known_hosts has no entry for $lookup" >&2; exit 1; }
+
+      - name: Guarded deployment on server
+        env:
+          VM_HOST: ${{ vars.VM_HOST }}
+          VM_PORT: ${{ vars.VM_SSH_PORT }}
+          VM_USER: ${{ vars.VM_USER }}
+          ENVIRONMENT: ${{ steps.meta.outputs.environment }}
+          IMAGE: ${{ steps.meta.outputs.image }}
+          MODULES: ${{ steps.meta.outputs.modules }}
+          IMAGE_ONLY: ${{ steps.meta.outputs.image_only }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          port="${VM_PORT:-22}"
+          mode=auto
+          module_arg=-
+          if [[ "$IMAGE_ONLY" == true ]]; then
+            mode=image
+          elif [[ -n "$MODULES" ]]; then
+            mode=modules
+            module_arg="$MODULES"
+          fi
+          request="deploy $ENVIRONMENT $IMAGE $mode $module_arg $GITHUB_ACTOR"
+          printf '%s\n' "$GHCR_TOKEN" | \
+            ssh -p "$port" -o BatchMode=yes "$VM_USER@$VM_HOST" "$request"
