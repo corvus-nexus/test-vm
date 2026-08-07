@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <!-- Deliberately nonexistent model: the guarded clone must reject this candidate. -->
+    <record id="intentional_expected_clone_failure"
+            model="phase0d_acceptance.intentional_missing_model"/>
+</odoo>
