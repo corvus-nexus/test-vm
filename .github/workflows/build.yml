@@ -262,3 +262,26 @@ jobs:
           request="deploy $ENVIRONMENT $IMAGE $mode $module_arg $GITHUB_ACTOR"
           printf '%s\n' "$GHCR_TOKEN" | \
             ssh -p "$port" -o BatchMode=yes "$VM_USER@$VM_HOST" "$request"
+
+
+      - name: Phase 0D genuine Database Manager import acceptance
+        if: ${{ needs.route.outputs.environment == 'development' }}
+        env:
+          VM_HOST: ${{ vars.VM_HOST }}
+          VM_PORT: ${{ vars.VM_SSH_PORT }}
+          VM_USER: ${{ vars.VM_USER }}
+          IMPORT_SSH_KEY: ${{ secrets.PHASE0D_IMPORT_SSH_KEY }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          [[ -n "$IMPORT_SSH_KEY" ]] || { echo 'Transient import key is unavailable.' >&2; exit 1; }
+          printf '%s\n' "$IMPORT_SSH_KEY" > ~/.ssh/phase0d_import_ed25519
+          chmod 0600 ~/.ssh/phase0d_import_ed25519
+          ssh-keygen -y -f ~/.ssh/phase0d_import_ed25519 >/dev/null
+          port="${VM_PORT:-22}"
+          printf '%s\n' "$GHCR_TOKEN" | \
+            ssh -i ~/.ssh/phase0d_import_ed25519 -p "$port" \
+              -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+              -o UserKnownHostsFile=~/.ssh/known_hosts \
+              "$VM_USER@$VM_HOST" phase0d-import-development
