@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+  <record id="phase0d_live_promotion_marker" model="ir.config_parameter">
+    <field name="phase0d_deliberately_invalid_field">must-fail</field>
+  </record>
+</odoo>
