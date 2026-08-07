@@ -64,7 +64,7 @@ jobs:
       contents: read
       packages: read
     concurrency:
-      group: deploy-${{ needs.route.outputs.environment }}
+      group: deploy-${{ github.repository_id }}
       cancel-in-progress: false
     environment: ${{ needs.route.outputs.environment }}
     steps:
