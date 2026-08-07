@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
-<odoo>
-  <!-- New immutable candidate after the CI stdin-containment repair. -->
+<odoo noupdate="1">
+  <!-- Harmless marker proving that the exact tested digest reached live. -->
   <record id="phase0d_live_promotion_marker" model="ir.config_parameter">
-    <field name="phase0d_deliberately_invalid_field">must-fail</field>
+    <field name="key">phase0d.acceptance.live_promotion</field>
+    <field name="value">fixed</field>
   </record>
 </odoo>
