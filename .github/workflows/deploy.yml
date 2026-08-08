@@ -16,6 +16,10 @@ on:
         required: false
         default: false
         type: boolean
+      source_sha:
+        description: Source commit for a digest image; must equal the selected ref commit
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -76,6 +80,7 @@ jobs:
           DEFAULT_MODULES: ${{ vars.ODOO_DEPLOY_MODULES }}
           IMAGE_ONLY: ${{ inputs.image_only }}
           INPUT_IMAGE: ${{ inputs.image }}
+          INPUT_SOURCE_SHA: ${{ inputs.source_sha }}
           ROUTED_ENVIRONMENT: ${{ needs.route.outputs.environment }}
         run: |
           set -Eeuo pipefail
@@ -85,11 +90,20 @@ jobs:
           image="$INPUT_IMAGE"
           [[ "$image" =~ ^ghcr\.io/[a-z0-9._-]+/[a-z0-9._/-]+(@sha256:[a-f0-9]{64}|:sha-[a-f0-9]{40})$ ]] || { echo 'Image must use an immutable sha-COMMIT tag or sha256 digest.' >&2; exit 1; }
           [[ "$image" == "$expected":* || "$image" == "$expected"@sha256:* ]] || { echo 'Image is outside this repository package.' >&2; exit 1; }
+          if [[ "$image" =~ :sha-([a-f0-9]{40})$ ]]; then
+            source_sha="${BASH_REMATCH[1]}"
+            [[ -z "$INPUT_SOURCE_SHA" || "$INPUT_SOURCE_SHA" == "$source_sha" ]] || { echo 'source_sha conflicts with the immutable image tag.' >&2; exit 1; }
+          else
+            source_sha="$INPUT_SOURCE_SHA"
+            [[ "$source_sha" =~ ^[a-f0-9]{40}$ ]] || { echo 'A 40-hex source_sha is required for a digest image.' >&2; exit 1; }
+          fi
+          [[ "$GITHUB_SHA" =~ ^[a-f0-9]{40}$ ]] || { echo 'Workflow run GITHUB_SHA is not a 40-hex commit.' >&2; exit 1; }
+          [[ "$source_sha" == "$GITHUB_SHA" ]] || { echo 'Requested image source commit does not match this workflow run GITHUB_SHA.' >&2; exit 1; }
           modules="${DISPATCH_MODULES:-$DEFAULT_MODULES}"
           image_only="${IMAGE_ONLY:-false}"
           [[ -z "$modules" || "$modules" =~ ^[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*$ ]] || { echo 'Module list is malformed.' >&2; exit 1; }
-          printf 'environment=%s\nimage=%s\nmodules=%s\nimage_only=%s\n' \
-            "$ROUTED_ENVIRONMENT" "$image" "$modules" "$image_only" >> "$GITHUB_OUTPUT"
+          printf 'environment=%s\nimage=%s\nmodules=%s\nimage_only=%s\nsource_sha=%s\n' \
+            "$ROUTED_ENVIRONMENT" "$image" "$modules" "$image_only" "$source_sha" >> "$GITHUB_OUTPUT"
 
       - name: Validate deployment connection settings
         shell: bash
@@ -146,6 +160,7 @@ jobs:
           IMAGE: ${{ steps.meta.outputs.image }}
           MODULES: ${{ steps.meta.outputs.modules }}
           IMAGE_ONLY: ${{ steps.meta.outputs.image_only }}
+          SOURCE_SHA: ${{ steps.meta.outputs.source_sha }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -Eeuo pipefail
@@ -158,6 +173,6 @@ jobs:
             mode=modules
             module_arg="$MODULES"
           fi
-          request="deploy $ENVIRONMENT $IMAGE $mode $module_arg $GITHUB_ACTOR"
+          request="deploy $ENVIRONMENT $IMAGE $mode $module_arg $GITHUB_ACTOR $GITHUB_ACTOR $GITHUB_REPOSITORY $GITHUB_REF $SOURCE_SHA $GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT"
           printf '%s\n' "$GHCR_TOKEN" | \
             ssh -p "$port" -o BatchMode=yes "$VM_USER@$VM_HOST" "$request"

@@ -16,8 +16,11 @@ FROM odoo:${ODOO_VERSION} AS addon-export
 ARG ODOO_VERSION
 ARG GIT_SHA=unknown
 USER root
-COPY . /opt/source/
-RUN install -d /opt/export/addons \
+# BuildKit bind mounts are read-only unless rw/readwrite is requested. Keep the
+# complete build context out of this stage's filesystem snapshot while the
+# scanner copies only validated addon output into the persisted export tree.
+RUN --mount=type=bind,source=.,target=/opt/source \
+    install -d /opt/export/addons \
     && python3 /opt/source/.ci/scan_addons.py \
       --root /opt/source \
       --odoo-version "$ODOO_VERSION" \
