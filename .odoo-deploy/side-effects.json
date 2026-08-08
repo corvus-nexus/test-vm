@@ -1,0 +1,11 @@
+{
+  "addons": {
+    "phase0d_acceptance": {
+      "categories": [
+        "none"
+      ]
+    }
+  },
+  "format": "odoo-addon-side-effects-v1",
+  "schema": 1
+}

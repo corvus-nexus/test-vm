@@ -20,14 +20,98 @@ from pathlib import Path
 from typing import Any
 
 
-MODULE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+MODULE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+(?:\.[0-9]+)*$")
 EXTERNAL_DEPENDENCY_RE = re.compile(r"^[A-Za-z0-9_.+:-]+$")
 IGNORED_PARTS = {".git", ".github", ".ci", "__pycache__", ".venv", "venv", "node_modules"}
+COPY_IGNORED_PARTS = IGNORED_PARTS | {".pytest_cache", ".mypy_cache"}
+MAX_CUSTOM_MODULES = 512
+SIDE_EFFECT_FORMAT = "odoo-addon-side-effects-v1"
+SIDE_EFFECT_CATEGORIES = (
+    "scheduled_jobs",
+    "outbound_email",
+    "inbound_email",
+    "payments",
+    "webhooks",
+    "queues",
+    "external_integrations",
+    "none",
+)
+MAX_SIDE_EFFECT_DECLARATION_BYTES = 1024 * 1024
 
 
 class ScanError(RuntimeError):
     pass
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ScanError(f"side-effect declaration contains duplicate key: {key}")
+        result[key] = value
+    return result
+
+
+def load_side_effect_declaration(path: Path, module_names: list[str]) -> tuple[dict[str, list[str]], str]:
+    if path.parent.is_symlink() or not path.parent.is_dir() or path.is_symlink() or not path.is_file():
+        raise ScanError(f"side-effect declaration is missing or not a regular file: {path}")
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise ScanError(f"cannot inspect side-effect declaration {path}: {exc}") from exc
+    if size <= 0 or size > MAX_SIDE_EFFECT_DECLARATION_BYTES:
+        raise ScanError(f"side-effect declaration has an invalid size: {path}")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_json_keys)
+    except ScanError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ScanError(f"cannot parse side-effect declaration {path}: {exc}") from exc
+    if not isinstance(value, dict) or set(value) != {"format", "schema", "addons"}:
+        raise ScanError("side-effect declaration must contain exactly format, schema, and addons")
+    if value["format"] != SIDE_EFFECT_FORMAT or value["schema"] != 1:
+        raise ScanError("side-effect declaration format or schema is unsupported")
+    addons = value["addons"]
+    if not isinstance(addons, dict):
+        raise ScanError("side-effect declaration addons must be an object")
+    expected = set(module_names)
+    declared = set(addons)
+    missing = sorted(expected - declared)
+    unknown = sorted(declared - expected)
+    if missing:
+        raise ScanError(f"side-effect declaration is missing addon(s): {', '.join(missing)}")
+    if unknown:
+        raise ScanError(f"side-effect declaration contains unknown addon(s): {', '.join(unknown)}")
+
+    category_order = {category: index for index, category in enumerate(SIDE_EFFECT_CATEGORIES)}
+    normalized: dict[str, list[str]] = {}
+    for module_name in sorted(module_names):
+        entry = addons[module_name]
+        if not isinstance(entry, dict) or set(entry) != {"categories"}:
+            raise ScanError(f"side-effect declaration for {module_name} must contain exactly categories")
+        categories = entry["categories"]
+        if not isinstance(categories, list) or not categories or not all(isinstance(item, str) for item in categories):
+            raise ScanError(f"side-effect categories for {module_name} must be a nonempty string array")
+        if len(categories) != len(set(categories)):
+            raise ScanError(f"side-effect categories for {module_name} contain duplicates")
+        invalid = sorted(set(categories) - set(SIDE_EFFECT_CATEGORIES))
+        if invalid:
+            raise ScanError(f"side-effect categories for {module_name} are unknown: {', '.join(invalid)}")
+        ordered = sorted(categories, key=category_order.__getitem__)
+        if categories != ordered:
+            raise ScanError(f"side-effect categories for {module_name} are not in canonical order")
+        if "none" in categories and categories != ["none"]:
+            raise ScanError(f"side-effect category none must be exclusive for {module_name}")
+        normalized[module_name] = categories
+
+    canonical = {
+        "format": SIDE_EFFECT_FORMAT,
+        "schema": 1,
+        "addons": {name: {"categories": normalized[name]} for name in sorted(normalized)},
+    }
+    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return normalized, hashlib.sha256(encoded).hexdigest()
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
@@ -136,6 +220,8 @@ def discover(root: Path, odoo_version: str, compatibility: str) -> list[dict[str
                 "checksum": module_checksum(module_dir),
             }
         )
+        if len(modules) > MAX_CUSTOM_MODULES:
+            raise ScanError(f"repository contains more than {MAX_CUSTOM_MODULES} custom addons")
     for warning in warnings:
         print(f"WARNING: {warning}", file=sys.stderr)
     return modules
@@ -151,7 +237,10 @@ def copy_modules(root: Path, destination: Path, modules: list[dict[str, Any]]) -
         shutil.copytree(
             source,
             target,
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache", ".mypy_cache"),
+            # Keep export membership identical to checksum membership. In
+            # particular, never let copytree dereference a symlink hidden
+            # below a directory that module_checksum deliberately ignores.
+            ignore=shutil.ignore_patterns(*sorted(COPY_IGNORED_PARTS), "*.pyc"),
         )
 
 
@@ -161,6 +250,7 @@ def main() -> int:
     parser.add_argument("--odoo-version", required=True)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--copy-to", type=Path)
+    parser.add_argument("--side-effects", type=Path)
     parser.add_argument("--compatibility", choices=("strict", "warn"), default="strict")
     parser.add_argument("--git-sha", default=os.environ.get("GIT_SHA", "unknown"))
     args = parser.parse_args()
@@ -168,12 +258,22 @@ def main() -> int:
     if not root.is_dir():
         raise ScanError(f"repository root is not a directory: {root}")
     modules = discover(root, args.odoo_version, args.compatibility)
+    declaration_path = args.side_effects or root / ".odoo-deploy" / "side-effects.json"
+    side_effects, declaration_sha256 = load_side_effect_declaration(
+        declaration_path, [module["name"] for module in modules]
+    )
+    for module in modules:
+        module["side_effect_categories"] = side_effects[module["name"]]
     if args.copy_to:
         copy_modules(root, args.copy_to, modules)
     result = {
-        "schema": 1,
+        "schema": 2,
         "odoo_version": args.odoo_version,
         "git_sha": args.git_sha,
+        "side_effect_contract": {
+            "format": SIDE_EFFECT_FORMAT,
+            "sha256": declaration_sha256,
+        },
         "custom_modules": modules,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
