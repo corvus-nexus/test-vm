@@ -139,6 +139,9 @@ jobs:
           context: .
           file: .ci/Dockerfile
           push: true
+          platforms: linux/amd64
+          sbom: true
+          provenance: mode=max
           tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=gha,scope=${{ github.ref_name }}
           cache-to: type=gha,mode=max,scope=${{ github.ref_name }}
@@ -147,6 +150,19 @@ jobs:
             GIT_SHA=${{ github.sha }}
             BUILD_DATE=${{ steps.meta.outputs.build_date }}
             SOURCE_URL=https://github.com/${{ github.repository }}
+
+      - name: Check unsigned attestation descriptor/predicate annotation presence
+        shell: bash
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          BUILT_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -Eeuo pipefail
+          # This checks unsigned descriptor/predicate annotation presence only;
+          # layer payload schemas and subjects remain unverified.
+          python3 .ci/verify_attestations.py \
+            --image "$IMAGE" \
+            --digest "$BUILT_DIGEST"
 
       - name: Verify immutable commit tag after push
         shell: bash
@@ -259,6 +275,6 @@ jobs:
             mode=modules
             module_arg="$MODULES"
           fi
-          request="deploy $ENVIRONMENT $IMAGE $mode $module_arg $GITHUB_ACTOR"
+          request="deploy $ENVIRONMENT $IMAGE $mode $module_arg $GITHUB_ACTOR $GITHUB_ACTOR $GITHUB_REPOSITORY $GITHUB_REF $GITHUB_SHA $GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT"
           printf '%s\n' "$GHCR_TOKEN" | \
             ssh -p "$port" -o BatchMode=yes "$VM_USER@$VM_HOST" "$request"
